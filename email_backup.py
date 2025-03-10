@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+import argparse
 import email
 import getpass
 import imaplib
+import json
 import logging
 import os
 import plistlib
@@ -10,6 +12,7 @@ import zipfile
 from datetime import datetime
 from email.header import decode_header
 
+import keyring
 from tqdm import tqdm
 
 
@@ -127,26 +130,104 @@ def select_account(accounts):
             print("Please enter a valid number.")
 
 
-def get_credentials():
-    """Get email credentials from user"""
-    # Try to get accounts from Mail.app
+def get_accounts_file():
+    """Get the path to the accounts file"""
+    documents_dir = os.path.expanduser("~/Documents")
+    backup_base = os.path.join(documents_dir, "email_backups")
+    os.makedirs(backup_base, exist_ok=True)
+    return os.path.join(backup_base, ".accounts.json")
+
+
+def load_accounts():
+    """Load saved email accounts"""
+    accounts_file = get_accounts_file()
+    if os.path.exists(accounts_file):
+        try:
+            with open(accounts_file, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.error(f"Error loading accounts: {str(e)}")
+    return []
+
+
+def save_accounts(accounts):
+    """Save email accounts (without passwords)"""
+    accounts_file = get_accounts_file()
+    try:
+        with open(accounts_file, "w") as f:
+            json.dump(accounts, f, indent=2)
+    except Exception as e:
+        logging.error(f"Error saving accounts: {str(e)}")
+
+
+def add_account(email_address=None):
+    """Add a new email account"""
+    # If email is provided, try to find it in Mail.app accounts first
+    if email_address:
+        accounts = get_mail_app_accounts()
+        if accounts:
+            for account in accounts:
+                if account["email"] == email_address:
+                    imap_server = account["imap_server"]
+                    print(f"\nFound account: {sanitize_email(email_address)}")
+                    password = getpass.getpass(
+                        "Enter password (or App Password if 2FA is enabled): "
+                    )
+                    return {
+                        "email": email_address,
+                        "imap_server": imap_server,
+                        "password": password,
+                    }
+
+    # If no email provided or not found in Mail.app, try Mail.app accounts first
     accounts = get_mail_app_accounts()
     if accounts:
         selected_account = select_account(accounts)
         if selected_account:
-            safe_email = sanitize_email(selected_account["email"])
-            print(f"\nSelected account: {safe_email}")
+            email_address = selected_account["email"]
+            imap_server = selected_account["imap_server"]
+            print(f"\nSelected account: {sanitize_email(email_address)}")
             password = getpass.getpass(
                 "Enter password (or App Password if 2FA is enabled): "
             )
-            return selected_account["email"], password, selected_account["imap_server"]
+            return {
+                "email": email_address,
+                "imap_server": imap_server,
+                "password": password,
+            }
 
-    # Fall back to manual input
-    print("\nNo Mail.app accounts found or manual entry selected.")
-    email_address = input("Enter email address: ")
+    # Manual input
+    if not email_address:
+        email_address = input("Enter email address: ")
     password = getpass.getpass("Enter password: ")
     imap_server = input("Enter IMAP server: ")
-    return email_address, password, imap_server
+
+    return {"email": email_address, "imap_server": imap_server, "password": password}
+
+
+def store_account(account):
+    """Store account securely"""
+    # Store password in keyring
+    keyring.set_password("email_backup", account["email"], account["password"])
+
+    # Store account info without password
+    accounts = load_accounts()
+    account_info = {"email": account["email"], "imap_server": account["imap_server"]}
+
+    # Update if account exists, otherwise append
+    for i, existing in enumerate(accounts):
+        if existing["email"] == account["email"]:
+            accounts[i] = account_info
+            break
+    else:
+        accounts.append(account_info)
+
+    save_accounts(accounts)
+
+
+def get_account_password(email):
+    """Get stored password for account"""
+    return keyring.get_password("email_backup", email)
 
 
 def connect_to_server(email_address, password, imap_server, logger):
@@ -527,50 +608,106 @@ def create_backup(email_address, logger):
     return zip_filename
 
 
+def backup_account(email_address, password, imap_server, logger):
+    """Backup a single email account"""
+    try:
+        # Connect to server
+        imap = connect_to_server(email_address, password, imap_server, logger)
+
+        # Get folder structure
+        folders = get_folder_structure(imap, logger)
+
+        # Create main directory for this email account
+        account_dir = get_backup_dir(email_address)
+        os.makedirs(account_dir, exist_ok=True)
+
+        # Download emails from each folder
+        all_folders_successful = True
+        for folder in folders:
+            # Create folder directory with sanitized name
+            safe_folder_name = sanitize_folder_name(folder)
+            folder_path = os.path.join(account_dir, safe_folder_name)
+            os.makedirs(folder_path, exist_ok=True)
+
+            # Download emails
+            download_emails(imap, folder, folder_path, logger)
+
+            # Verify download count
+            if not verify_download_count(imap, folder, folder_path, logger):
+                all_folders_successful = False
+
+        # Create zip backup
+        zip_filename = create_backup(account_dir, logger)
+
+        if all_folders_successful:
+            logger.info(
+                f"Backup completed successfully for {sanitize_email(email_address)} - all emails verified"
+            )
+        else:
+            logger.warning(
+                f"Backup completed with some verification issues for {sanitize_email(email_address)}"
+            )
+
+        # Cleanup
+        imap.close()
+        imap.logout()
+
+        return all_folders_successful
+    except Exception as e:
+        logger.error(
+            f"Error backing up account {sanitize_email(email_address)}: {str(e)}"
+        )
+        return False
+
+
 def main():
-    # Get credentials
-    email_address, password, imap_server = get_credentials()
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Email Backup Tool")
+    parser.add_argument(
+        "--new",
+        action="append",
+        help="Add a new email account. Can be specified multiple times with email addresses.",
+        default=[],
+    )
+    args = parser.parse_args()
 
-    # Setup logging
-    logger = setup_logging(email_address)
-    logger.info("Starting email backup process")
+    # Handle new account additions
+    if args.new:
+        print(f"\nAdding {len(args.new)} new account(s)...")
+        for email in args.new:
+            print(f"\nAdding account: {sanitize_email(email)}")
+            account = add_account(email)
+            store_account(account)
+            print(f"Account {sanitize_email(account['email'])} added successfully")
 
-    # Connect to server
-    imap = connect_to_server(email_address, password, imap_server, logger)
+    # Load all accounts
+    accounts = load_accounts()
+    if not accounts:
+        print("No accounts found. Use --new to add an account.")
+        return
 
-    # Get folder structure
-    folders = get_folder_structure(imap, logger)
+    # Backup each account
+    all_successful = True
+    for account in accounts:
+        email = account["email"]
+        password = get_account_password(email)
+        if not password:
+            print(f"\nPassword not found for {sanitize_email(email)}. Skipping...")
+            all_successful = False
+            continue
 
-    # Create main directory for this email account
-    account_dir = get_backup_dir(email_address)
-    os.makedirs(account_dir, exist_ok=True)
+        # Setup logging for this account
+        logger = setup_logging(email)
+        logger.info(f"Starting backup for {sanitize_email(email)}")
 
-    # Download emails from each folder
-    all_folders_successful = True
-    for folder in folders:
-        # Create folder directory with sanitized name
-        safe_folder_name = sanitize_folder_name(folder)
-        folder_path = os.path.join(account_dir, safe_folder_name)
-        os.makedirs(folder_path, exist_ok=True)
+        # Backup the account
+        if not backup_account(email, password, account["imap_server"], logger):
+            all_successful = False
 
-        # Download emails
-        download_emails(imap, folder, folder_path, logger)
-
-        # Verify download count
-        if not verify_download_count(imap, folder, folder_path, logger):
-            all_folders_successful = False
-
-    # Create zip backup
-    zip_filename = create_backup(account_dir, logger)
-
-    if all_folders_successful:
-        logger.info("Backup process completed successfully - all emails verified")
+    if all_successful:
+        print("\nAll accounts backed up successfully")
     else:
-        logger.warning("Backup process completed with some verification issues")
-
-    # Cleanup
-    imap.close()
-    imap.logout()
+        print("\nSome accounts had issues during backup")
 
 
 if __name__ == "__main__":
