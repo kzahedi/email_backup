@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import email
 import getpass
 import imaplib
@@ -269,15 +270,176 @@ def sanitize_folder_name(folder_name):
     return folder_name
 
 
+def _imap_utf7_encode(s):
+    """Encode string to IMAP UTF-7"""
+    if not s:
+        return ""
+
+    def modified_base64(s):
+        s_utf7 = s.encode("utf-16be")
+        return base64.b64encode(s_utf7).decode("ascii").rstrip("=").replace("/", ",")
+
+    def do_encode(s):
+        r = []
+        _in = []
+        for c in s:
+            if ord(c) in range(0x20, 0x7F) and c != "&":
+                if _in:
+                    r.extend(["&", modified_base64("".join(_in)), "-"])
+                    del _in[:]
+                r.append(c)
+            else:
+                _in.append(c)
+        if _in:
+            r.extend(["&", modified_base64("".join(_in)), "-"])
+        return "".join(r)
+
+    return do_encode(s)
+
+
+def _imap_utf7_decode(s):
+    """Decode string from IMAP UTF-7"""
+    if not s:
+        return ""
+
+    def modified_unbase64(s):
+        b = s.replace(",", "/")
+        pad_len = len(b) % 4
+        if pad_len:
+            b += "=" * (4 - pad_len)
+        return base64.b64decode(b).decode("utf-16be")
+
+    r = []
+    decoded = bytearray()
+    _in_b64 = False
+    for c in s:
+        if _in_b64:
+            if c == "-":
+                if decoded:
+                    r.append(modified_unbase64(decoded.decode("ascii")))
+                    decoded = bytearray()
+                else:
+                    r.append("&")
+                _in_b64 = False
+            else:
+                decoded.extend(c.encode("ascii"))
+        else:
+            if c == "&":
+                _in_b64 = True
+            else:
+                r.append(c)
+    if decoded:
+        r.append(modified_unbase64(decoded.decode("ascii")))
+    return "".join(r)
+
+
+def encode_folder_name(folder_name, logger=None):
+    """Encode folder name for IMAP using modified UTF-7"""
+    if not folder_name:
+        return ""
+    try:
+        # First try to encode using IMAP UTF-7
+        return _imap_utf7_encode(folder_name)
+    except Exception as e:
+        if logger:
+            logger.error(f"Error encoding folder name {folder_name}: {str(e)}")
+        return folder_name
+
+
+def decode_folder_name(folder_name, logger=None):
+    """Decode folder name from IMAP modified UTF-7"""
+    if not folder_name:
+        return ""
+    try:
+        # First try to decode using IMAP UTF-7
+        return _imap_utf7_decode(folder_name)
+    except Exception as e:
+        if logger:
+            logger.error(f"Error decoding folder name {folder_name}: {str(e)}")
+        return folder_name
+
+
 def get_folder_structure(imap, logger):
     """Get all folders from the email server"""
     folders = []
-    for folder_data in imap.list()[1]:
-        folder_name = folder_data.decode().split('"/"')[-1].strip()
-        folders.append(folder_name)
-    safe_folders = [sanitize_folder(f) for f in folders]
-    logger.info(f"Found folders: {safe_folders}")
-    return folders
+    try:
+        # For IONOS servers, we need to use specific LIST command formats
+        for list_pattern in ["", "%", "*"]:
+            try:
+                # Use NIL as reference to avoid quoting issues
+                result, folder_list = imap.list("NIL", list_pattern)
+                if result != "OK":
+                    continue
+
+                for folder_data in folder_list:
+                    try:
+                        # Convert bytes to string and decode IMAP UTF-7
+                        folder_str = folder_data.decode("utf-8", errors="replace")
+                        logger.debug(f"Raw folder data: {folder_str}")
+
+                        # Parse folder name from response
+                        parts = folder_str.split('"')
+                        if len(parts) > 1:
+                            # If quoted, take the last quoted part
+                            folder_name = parts[-2]
+                        else:
+                            # If not quoted, take the last part
+                            folder_name = folder_str.split()[-1]
+
+                        # Skip special folders
+                        if not folder_name or folder_name in ["/", ".", "[Gmail]"]:
+                            continue
+
+                        # Decode folder name from IMAP UTF-7
+                        folder_name = decode_folder_name(folder_name, logger)
+                        logger.debug(f"Decoded folder name: {folder_name}")
+
+                        if folder_name:
+                            folders.append(folder_name)
+                            logger.debug(f"Added folder: {folder_name}")
+
+                    except Exception as e:
+                        logger.warning(
+                            f"Error processing folder entry {folder_data}: {str(e)}"
+                        )
+                        continue
+
+                if folders:
+                    break  # If we found folders, no need to try other patterns
+
+            except Exception as e:
+                logger.warning(f"Error with LIST pattern '{list_pattern}': {str(e)}")
+                continue
+
+        if not folders:
+            # Try common folder names as fallback
+            common_folders = [
+                "INBOX",
+                "Sent",
+                "Drafts",
+                "Trash",
+                "Junk",
+                "Archive",
+                "Entwürfe",  # Use actual UTF-8 name instead of encoded version
+            ]
+            for folder in common_folders:
+                try:
+                    encoded_folder = encode_folder_name(folder, logger)
+                    result, _ = imap.select(encoded_folder)
+                    if result == "OK":
+                        folders.append(folder)  # Use original name
+                        logger.info(f"Found folder through direct selection: {folder}")
+                except Exception as e:
+                    logger.debug(f"Failed to select folder {folder}: {str(e)}")
+                    continue
+
+        safe_folders = [sanitize_folder(f) for f in folders]
+        logger.info(f"Found folders: {safe_folders}")
+
+    except Exception as e:
+        logger.error(f"Error getting folder structure: {str(e)}")
+
+    return list(set(folders))  # Remove duplicates
 
 
 def get_last_email_id(folder_path, logger):
@@ -391,7 +553,12 @@ def verify_download_count(imap, folder, local_path, logger):
     """Verify that all emails were downloaded successfully"""
     try:
         # Get count from server
-        imap.select(folder)
+        encoded_folder = encode_folder_name(folder, logger)
+        result, data = imap.select(encoded_folder)
+        if result != "OK":
+            logger.error(f"Failed to select folder {sanitize_folder(folder)}: {data}")
+            return False
+
         _, message_numbers = imap.search(None, "ALL")
         server_count = len(message_numbers[0].split())
 
@@ -450,8 +617,17 @@ def download_emails(imap, folder, local_path, logger):
     safe_folder = sanitize_folder(folder)
     logger.info(f"Starting download from folder: {safe_folder}")
 
-    # Select the folder
-    imap.select(folder)
+    try:
+        # Encode folder name for IMAP
+        encoded_folder = encode_folder_name(folder, logger)
+        # Select the folder using encoded name
+        result, data = imap.select(encoded_folder)
+        if result != "OK":
+            logger.error(f"Failed to select folder {safe_folder}: {data}")
+            return
+    except Exception as e:
+        logger.error(f"Error selecting folder {safe_folder}: {str(e)}")
+        return
 
     # Get last downloaded email ID
     last_id = get_last_email_id(local_path, logger)
@@ -591,21 +767,31 @@ def download_emails(imap, folder, local_path, logger):
 
 def create_backup(email_address, logger):
     """Create a zip file containing all downloaded emails"""
+    account_dir = get_backup_dir(email_address)
     safe_email = sanitize_email(email_address)
     zip_filename = f"{safe_email.replace('@', '_at_')}_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    zip_filepath = os.path.join(account_dir, zip_filename)
     logger.info(f"Creating zip archive: {zip_filename}")
 
-    with zipfile.ZipFile(zip_filename, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for root, _, files in os.walk(email_address):
-            for file in files:
-                if file.endswith(".log"):  # Skip log files
-                    continue
-                filepath = os.path.join(root, file)
-                arcname = os.path.relpath(filepath, email_address)
-                zipf.write(filepath, arcname)
+    try:
+        with zipfile.ZipFile(zip_filepath, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for root, _, files in os.walk(account_dir):
+                for file in files:
+                    # Skip log files and the zip file itself
+                    if (
+                        file.endswith(".log")
+                        or os.path.join(root, file) == zip_filepath
+                    ):
+                        continue
+                    filepath = os.path.join(root, file)
+                    arcname = os.path.relpath(filepath, account_dir)
+                    zipf.write(filepath, arcname)
 
-    logger.info(f"Zip archive created successfully: {zip_filename}")
-    return zip_filename
+        logger.info(f"Zip archive created successfully: {zip_filename}")
+        return zip_filename
+    except Exception as e:
+        logger.error(f"Error creating zip archive: {str(e)}")
+        return None
 
 
 def backup_account(email_address, password, imap_server, logger):
@@ -711,4 +897,6 @@ def main():
 
 
 if __name__ == "__main__":
+    main()
+
     main()
