@@ -1,0 +1,2 @@
+# No external dependencies required - using only Python standard library
+tqdm>=4.65.0
