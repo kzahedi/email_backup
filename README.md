@@ -12,11 +12,14 @@ This tool allows you to backup your Gmail account by downloading all emails from
 - Preserves folder structure
 - Handles multipart emails
 - Secure password input
+- Automatic detection of Mail.app email accounts (macOS)
+- Privacy protection for sensitive information
 
 ## Requirements
 
 - Python 3.6 or higher
 - tqdm package for progress bars
+- macOS (for Mail.app account integration)
 
 ## Usage
 
@@ -25,12 +28,15 @@ This tool allows you to backup your Gmail account by downloading all emails from
    python email_backup.py
    ```
 
-2. Enter your Gmail credentials when prompted:
-   - Email address
-   - Password (or App Password if 2FA is enabled)
+2. The script will:
+   - Automatically detect email accounts configured in Mail.app
+   - Show a list of available accounts (with email addresses partially redacted)
+   - Let you select an account or enter credentials manually
+   - If selecting a Mail.app account, you'll only need to enter the password
+   - If entering manually, provide email address and password
 
-3. The script will:
-   - Connect to Gmail
+3. The script will then:
+   - Connect to your email server
    - Download all folders and emails (or only new emails if running for the second time)
    - Download all attachments
    - Create a zip file with the backup
@@ -64,6 +70,15 @@ All backups are stored in your Documents folder:
 - Each folder contains a `.last_email_id` file to track the last downloaded email
 - A zip file is created with the format: `email_at_domain_backup_YYYYMMDD_HHMMSS.zip`
 
+## Mail.app Integration
+
+On macOS, the script can automatically detect email accounts configured in Mail.app:
+- Reads account information from `~/Library/Mail/V9/MailData/Accounts.plist`
+- Shows a list of available email accounts (with email addresses partially redacted)
+- Allows you to select an account or enter credentials manually
+- Only requires password entry for Mail.app accounts
+- Falls back to manual entry if no Mail.app accounts are found
+
 ## Incremental Backup
 
 The script supports incremental backups:
@@ -72,12 +87,39 @@ The script supports incremental backups:
 - Each folder maintains its own `.last_email_id` file to track the last downloaded email
 - You can run the script multiple times to keep your backup up to date
 
-## Security Note
+## Security and Privacy
 
-- Your password is never stored and is only used for the current session
-- The script uses secure IMAP SSL connection
+The script includes several security and privacy protection measures:
+
+### Password Security
+- Passwords are never stored and are only used for the current session
 - Password input is hidden from the screen
 - For Gmail accounts with 2FA enabled, use an App Password instead of your regular password
+
+### Connection Security
+- Uses secure IMAP SSL connection
+- All network communication is encrypted
+
+### Privacy Protection
+- Email addresses are partially redacted in logs (e.g., "j***@example.com")
+- Folder names containing email addresses are redacted in logs
+- Log files include a warning about potential sensitive information
+- Backup files are stored locally only
+- No data is transmitted to external servers
+
+### Sensitive Data Detection
+The script includes detection for common sensitive data patterns:
+- Credit card numbers
+- Social security numbers
+- Email addresses
+- Phone numbers
+- Passport numbers
+
+### File System Security
+- All backup files are stored in your local Documents folder
+- Backup files are not included in Git repository
+- Log files are excluded from Git repository
+- Each backup session creates a new log file with timestamp
 
 ## Error Handling
 
@@ -87,5 +129,6 @@ The script includes error handling for:
 - Email decoding issues
 - File system operations
 - Attachment processing errors
+- Mail.app configuration reading errors
 
 If any individual email or attachment fails to process, the script will continue with the remaining items and report the error.
